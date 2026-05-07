@@ -47,8 +47,14 @@ CATEGORY_RULES = [
     ("产品", ["产品", "產品", "条款", "條款", "保单", "保單"]),
     ("行政规则", ["行政", "操作", "流程", "服务", "服務", "投保", "操作指引", "管理"]),
     ("案例", ["案例"]),
+    ("优惠推广", ["优惠", "優惠", "推廣", "推广", "禮遇", "礼遇", "预缴", "預繳"]),
 ]
 DEFAULT_CATEGORY = "一般查询"
+
+# 保司文件2.0 下不是保司名的特殊目录
+_NON_COMPANY_DIRS = {"优惠文件", "非标准文本文件"}
+# 日期目录名, 如 "24年12月"
+_DATE_DIR_RE = re.compile(r"^\d{2}年\d{1,2}月$")
 
 
 def classify_doc(doc_filename: str) -> str:
@@ -65,16 +71,37 @@ def extract_company_from_path(md_path: Path, base_dir: str = "保司文件2.0") 
     """
     从 md 文件路径里提取保司名 (即 base_dir 下的第一级子目录)
     例: .../保司文件2.0/万通/xxx/yyy.md -> 万通
-    如果路径里找不到 base_dir, 退回到取父目录的父目录名
+    特殊处理:
+      - 非标准文本文件/保司名/... -> 保司名
+      - 优惠文件/日期/保司名.pdf-uuid/... -> 保司名
     """
     parts = md_path.parts
     if base_dir in parts:
         idx = parts.index(base_dir)
         if idx + 1 < len(parts):
-            return parts[idx + 1]
-    # 兜底: 用父目录的父目录名 (因为结构通常是 保司名/文档名/xxx.md)
-    if len(md_path.parents) >= 2:
-        return md_path.parents[1].name
+            candidate = parts[idx + 1]
+
+            if candidate == "非标准文本文件" and idx + 2 < len(parts):
+                return parts[idx + 2]
+
+            if candidate == "优惠文件":
+                # 路径形如: 优惠文件/24年12月/万通.pdf-uuid/full.md
+                parent_name = md_path.parent.name
+                company = parent_name.split(".pdf-", 1)[0] if ".pdf-" in parent_name else parent_name
+                if company:
+                    return company
+
+            return candidate
+
+    # 兜底: 从父目录链中找到第一个有意义的目录名
+    # 跳过 parents[0] (文档名目录本身), 从 grandparent 开始找
+    for p in list(md_path.parents)[1:]:
+        if not p.name or p.name in _NON_COMPANY_DIRS or _DATE_DIR_RE.match(p.name):
+            continue
+        if ".pdf-" in p.name:
+            continue
+        return p.name
+
     return "未知保司"
 
 
@@ -84,18 +111,24 @@ def extract_doc_name_from_path(md_path: Path) -> str:
     实际数据中, md 文件常常都叫 full.md, 真正的文档名在父目录上, 形如:
         內部繳費指引.pdf-f6385a61-99f1-4c89-95ef-947fae60dcc3/full.md
         富饶千秋产品手册_2025_01/富饶千秋产品手册_2025_01.md
-
     策略: 优先使用父目录名, 并去掉常见的后缀杂质 (如 .pdf-uuid)
     """
     parent_name = md_path.parent.name
     # 如果父目录名形如 "xxx.pdf-{uuid}", 去掉 .pdf 及之后的部分
-    # uuid 形如 f6385a61-99f1-4c89-95ef-947fae60dcc3 (8-4-4-4-12)
     cleaned = re.sub(
         r"\.pdf-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
         "",
         parent_name,
         flags=re.IGNORECASE,
     )
+
+    parts = md_path.parts
+    # 优惠文件下的文档名额外携带有意义的上下文: 保司_优惠_日期
+    if "优惠文件" in parts:
+        grandparent = md_path.parents[1].name
+        if _DATE_DIR_RE.match(grandparent):
+            return f"{cleaned}_优惠_{grandparent}"
+
     # 兜底: 如果父目录名也没意义(比如就叫 "万通" 这种, 即文件直接在保司目录下),
     # 回退用文件名 stem
     if not cleaned or cleaned == md_path.parents[1].name:
@@ -149,13 +182,14 @@ SYSTEM_PROMPT = """你是一个专业的保险知识 QA 数据标注员。你正
 
 ## 分类字段
 
-每条 QA 必须打一个分类标签, 从这 7 个里选一个最贴切的:
+每条 QA 必须打一个分类标签, 从这 8 个里选一个最贴切的:
 - 缴费: 缴费方式、币种、汇率、信用卡、行政费等
 - 核保: 健康核保、疾病评估、核保要求、体检等
 - 理赔: 理赔流程、所需材料、理赔时效等
 - 产品: 产品条款、保障范围、保单内容、产品手册等
 - 行政规则: 投保流程、保单变更、退保、保单服务、操作指引等
 - 案例: 具体案例分析
+- 优惠推广: 保费折扣、优惠活动、限时礼遇、预缴优惠等
 - 一般查询: 不属于以上任何一类的通用问题
 
 ## 严格规则
@@ -196,14 +230,23 @@ USER_PROMPT_TEMPLATE = """保险公司名: {company}
 
 
 def extract_json_array(text: str):
-    """从模型输出中提取 JSON 数组, 容错处理 markdown 代码块"""
+    """从模型输出中提取 JSON 数组, 容错处理 markdown 代码块和非法转义"""
     text = re.sub(r"^```(?:json)?\s*", "", text.strip())
     text = re.sub(r"\s*```$", "", text.strip())
     start = text.find("[")
     end = text.rfind("]")
     if start == -1 or end == -1:
         raise ValueError(f"模型输出中未找到 JSON 数组: {text[:200]}")
-    return json.loads(text[start : end + 1])
+    text = text[start : end + 1]
+    # 修复 LLM 产生的非法 JSON 转义 (如 \\% \\$ 等)
+    # JSON 仅允许 \\" \\\\ \\/ \\b \\f \\n \\r \\t \\uXXXX 这些转义
+    # 把反斜杠后跟非法字符的反斜杠转义为双反斜杠
+    text = re.sub(
+        r'\\(?!["\\/bfnrtu])',
+        r"\\\\",
+        text,
+    )
+    return json.loads(text)
 
 
 def call_llm(client: OpenAI, system: str, user: str) -> str:
@@ -227,7 +270,7 @@ def call_llm(client: OpenAI, system: str, user: str) -> str:
     raise RuntimeError(f"调用 LLM 失败 {MAX_RETRIES} 次: {last_err}")
 
 
-VALID_CATEGORIES = {"缴费", "核保", "理赔", "产品", "行政规则", "案例", "一般查询"}
+VALID_CATEGORIES = {"缴费", "核保", "理赔", "产品", "行政规则", "案例", "优惠推广", "一般查询"}
 
 
 def validate_qa(item: dict, company: str) -> tuple:
