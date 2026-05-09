@@ -6,3 +6,12 @@ qa_pairs.jsonl
 qa_pairs_sample.jsonl
 保司文件2.0/
 /.claude
+# 忽略批量生成的数据和日志文件
+qa_output/
+Excel_最终交付/
+测试子集/
+*.xlsx
+*.csv
+*.json
+*.jsonl
+error_list.txt
